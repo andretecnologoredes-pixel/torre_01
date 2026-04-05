@@ -1,0 +1,431 @@
+// ============================================================
+//  MONITOR DE TORRE - CÓDIGO BASE v3.1 (com OTA pela Internet)
+//  Libs: WiFiManager, PubSubClient, ArduinoOTA, ArduinoJson
+//  + HTTPUpdate (ESPhttpUpdate)
+// ============================================================
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+#include <ArduinoJson.h>
+
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>          // (ESPhttpUpdate)
+#include <WiFiClientSecure.h>
+
+// ============================================================
+//  >>>  MUDE APENAS ESTA LINHA PARA CADA TORRE  <<<
+// ============================================================
+#define TORRE_ID   "02"          // "01", "02", "03"...
+// ============================================================
+
+// ================= MQTT BROKER =================
+#define MQTT_SERVER   "broker.emqx.io"
+#define MQTT_PORT     1883
+
+// ================= TÓPICOS (gerados automaticamente) =================
+#define TOPIC_BASE    "torres/torre_" TORRE_ID
+#define TOPIC_TELEM   TOPIC_BASE "/telemetria"
+#define TOPIC_STATUS  TOPIC_BASE "/status"
+#define TOPIC_EVENTO  TOPIC_BASE "/evento"
+#define TOPIC_CMD     TOPIC_BASE "/cmd"
+#define TOPIC_ONLINE  TOPIC_BASE "/online"
+
+// ================= OTA INTERNET =================
+// 1) Você vai subir o .bin em um link HTTPS/HTTP direto.
+// 2) O Node-RED envia no tópico .../cmd o comando: update <URL>
+// Ex: update https://seu-dominio.com/torre_01.bin
+//
+// Se você quiser um fallback fixo por torre, coloque um URL abaixo.
+// (Opcional) - se vazio, só atualiza via comando MQTT.
+#define DEFAULT_FW_URL ""  // ex: "https://.../torre_01.bin"
+
+// ================= SENSOR =================
+#define PINO_SENSOR         34
+#define AMOSTRAS            400
+#define FILTRO_MEDIAS       4
+#define FATOR_CALIBRACAO    0.18f
+#define THRESHOLD_LAMPADA   6.0f
+#define MINIMO_RUIDO        3.0f
+
+// ================= ANTI FALSO POSITIVO =================
+#define TEMPO_CONFIRMACAO   10000UL   // 10s para confirmar falha
+#define TEMPO_RETORNO       3000UL    // 3s para confirmar retorno
+
+// ================= INTERVALOS =================
+#define INTERVALO_LEITURA   2000UL    // leitura a cada 2s
+#define INTERVALO_PUBLISH   5000UL    // publica a cada 5s
+#define INTERVALO_WIFI_CHK  30000UL   // checa WiFi a cada 30s
+
+// ================= ESTADO =================
+float         tensaoRms     = 0.0f;
+bool          lampadaOk     = true;
+bool          lastLampadaOk = true;
+unsigned long tempoFalha    = 0;
+unsigned long tempoRetorno  = 0;
+
+// ================= TIMERS =================
+unsigned long tLeitura   = 0;
+unsigned long tPublish   = 0;
+unsigned long tWifiChk   = 0;
+
+// ================= OBJETOS =================
+WiFiClient    espClient;
+PubSubClient  mqtt(espClient);
+
+// ============================================================
+//  PRINT VISUAL NO SERIAL MONITOR
+// ============================================================
+void printBanner() {
+  Serial.println();
+  Serial.println(F("╔══════════════════════════════════════╗"));
+  Serial.println(F("║     MONITOR DE TORRE - ESP32         ║"));
+  Serial.printf( "║     TORRE ID : %-22s║\n", TORRE_ID);
+  Serial.println(F("╚══════════════════════════════════════╝"));
+}
+
+void printStatus() {
+  Serial.println(F("┌──────────────────────────────────────┐"));
+  Serial.printf( "│ Torre   : %-27s│\n", TORRE_ID);
+  Serial.printf( "│ Tensão  : %-5.1f V                      │\n", tensaoRms);
+  Serial.printf( "│ Lâmpada : %-27s│\n", lampadaOk ? "✔  OPERACIONAL" : "✘  FALHA DETECTADA");
+  Serial.printf( "│ WiFi    : %-4d dBm                     │\n", WiFi.RSSI());
+  Serial.printf( "│ IP      : %-27s│\n", WiFi.localIP().toString().c_str());
+  Serial.printf( "│ MQTT    : %-27s│\n", mqtt.connected() ? "Conectado" : "Desconectado");
+  Serial.println(F("└──────────────────────────────────────┘"));
+}
+
+void printEvento(const char* msg) {
+  Serial.println(F("┌──────────────────────────────────────┐"));
+  Serial.printf( "│ ⚡ EVENTO: %-26s│\n", msg);
+  Serial.println(F("└──────────────────────────────────────┘"));
+}
+
+// ============================================================
+//  LEITURA RMS COM ANTI RUÍDO
+// ============================================================
+float lerTensaoRMS() {
+  float somaTensoes = 0.0f;
+
+  for (int f = 0; f < FILTRO_MEDIAS; f++) {
+    uint32_t soma = 0;
+    float somaQ   = 0.0f;
+
+    // Passa 1: calcula offset (DC)
+    for (int i = 0; i < AMOSTRAS; i++) {
+      soma += analogRead(PINO_SENSOR);
+      delayMicroseconds(80);
+    }
+    float offset = soma / (float)AMOSTRAS;
+
+    // Passa 2: calcula RMS sem DC
+    for (int i = 0; i < AMOSTRAS; i++) {
+      float s = analogRead(PINO_SENSOR) - offset;
+      somaQ  += s * s;
+      delayMicroseconds(80);
+    }
+
+    float rmsAdc = sqrtf(somaQ / (float)AMOSTRAS);
+    float tensao = rmsAdc * FATOR_CALIBRACAO;
+    if (tensao < MINIMO_RUIDO) tensao = 0.0f;
+    somaTensoes += tensao;
+  }
+
+  return somaTensoes / (float)FILTRO_MEDIAS;
+}
+
+// ============================================================
+//  MQTT - PUBLICAR EVENTO
+// ============================================================
+void publicarEvento(const char* msg) {
+  if (!mqtt.connected()) return;
+
+  StaticJsonDocument<128> doc;
+  doc["torre"]  = TORRE_ID;
+  doc["evento"] = msg;
+  doc["tensao"] = tensaoRms;
+
+  char payload[128];
+  serializeJson(doc, payload);
+  mqtt.publish(TOPIC_EVENTO, payload, false);
+  Serial.printf("[MQTT] Evento → %s\n", payload);
+}
+
+// ============================================================
+//  ANTI FALSO POSITIVO
+// ============================================================
+void processarLeitura() {
+  tensaoRms = lerTensaoRMS();
+  bool leituraAtual = (tensaoRms > THRESHOLD_LAMPADA);
+
+  if (!leituraAtual) {
+    // --- Possível FALHA ---
+    tempoRetorno = 0;
+    if (tempoFalha == 0) tempoFalha = millis();
+
+    if (lampadaOk && (millis() - tempoFalha >= TEMPO_CONFIRMACAO)) {
+      lampadaOk = false;
+      printEvento("Lampada APAGOU");
+      publicarEvento("Lampada apagou");
+    }
+
+  } else {
+    // --- Possível RETORNO ---
+    tempoFalha = 0;
+    if (!lampadaOk) {
+      if (tempoRetorno == 0) tempoRetorno = millis();
+
+      if (millis() - tempoRetorno >= TEMPO_RETORNO) {
+        lampadaOk    = true;
+        tempoRetorno = 0;
+        printEvento("Lampada VOLTOU");
+        publicarEvento("Lampada voltou");
+      }
+    }
+  }
+}
+
+// ============================================================
+//  MQTT - PUBLICAR TELEMETRIA
+// ============================================================
+void publicarTelemetria() {
+  if (!mqtt.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["torre"]   = TORRE_ID;
+  doc["tensao"]  = roundf(tensaoRms * 10.0f) / 10.0f;
+  doc["status"]  = lampadaOk ? "OK" : "FALHA";
+  doc["wifi"]    = WiFi.RSSI();
+  doc["ip"]      = WiFi.localIP().toString();
+  doc["uptime"]  = millis() / 1000;
+
+  char payload[256];
+  serializeJson(doc, payload);
+
+  mqtt.publish(TOPIC_TELEM,  payload, true);
+  mqtt.publish(TOPIC_STATUS, lampadaOk ? "OK" : "FALHA", true);
+
+  Serial.printf("[MQTT] Publicado → %s\n", payload);
+}
+
+// ============================================================
+//  OTA INTERNET - atualizar a partir de URL
+// ============================================================
+void publicarStatusOTA(const char* status, const char* detail) {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<256> doc;
+  doc["torre"] = TORRE_ID;
+  doc["status"] = status;
+  doc["detail"] = detail;
+  char out[256];
+  serializeJson(doc, out);
+  String t = String(TOPIC_BASE) + "/ota";
+  mqtt.publish(t.c_str(), out, false);
+}
+
+void atualizarFirmwarePorURL(const String& url) {
+  if (url.length() < 8) {
+    Serial.println("[OTA-HTTP] URL inválida.");
+    publicarStatusOTA("error", "url_invalida");
+    return;
+  }
+
+  Serial.printf("[OTA-HTTP] Iniciando update: %s\n", url.c_str());
+  publicarStatusOTA("start", url.c_str());
+
+  WiFiClientSecure client;
+  client.setTimeout(15000);
+
+  // Para HTTPS sem lidar com certificado. (OK para protótipo)
+  // Se quiser mais seguro: usar client.setCACert(...)
+  client.setInsecure();
+
+  httpUpdate.rebootOnUpdate(true);
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  t_httpUpdate_return ret = httpUpdate.update(client, url);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED: {
+      String err = String(httpUpdate.getLastError()) + ":" + httpUpdate.getLastErrorString();
+      Serial.printf("[OTA-HTTP] Falha: %s\n", err.c_str());
+      publicarStatusOTA("failed", err.c_str());
+      break;
+    }
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("[OTA-HTTP] Sem atualizações.");
+      publicarStatusOTA("no_update", "sem_atualizacao");
+      break;
+    case HTTP_UPDATE_OK:
+      Serial.println("[OTA-HTTP] OK. Reiniciando...");
+      publicarStatusOTA("ok", "rebooting");
+      break;
+  }
+}
+
+// ============================================================
+//  MQTT - CALLBACK (recebe comandos)
+// ============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  String msg;
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+  msg.trim();
+
+  Serial.printf("[CMD] Recebido: %s\n", msg.c_str());
+
+  if (msg == "status") {
+    publicarTelemetria();
+  } else if (msg == "restart") {
+    Serial.println("[CMD] Reiniciando...");
+    delay(500);
+    ESP.restart();
+  } else if (msg.startsWith("update")) {
+    // Formatos aceitos:
+    // 1) "update https://.../firmware.bin"
+    // 2) "update" (usa DEFAULT_FW_URL se configurado)
+    String url = "";
+    int sp = msg.indexOf(' ');
+    if (sp > 0) {
+      url = msg.substring(sp + 1);
+      url.trim();
+    } else {
+      url = String(DEFAULT_FW_URL);
+    }
+
+    if (url.length() == 0) {
+      Serial.println("[OTA-HTTP] Sem URL. Envie: update <URL> ou configure DEFAULT_FW_URL.");
+      publicarStatusOTA("error", "sem_url");
+      return;
+    }
+
+    atualizarFirmwarePorURL(url);
+  }
+}
+
+// ============================================================
+//  MQTT - RECONEXÃO
+// ============================================================
+void conectarMQTT() {
+  while (!mqtt.connected()) {
+    Serial.printf("[MQTT] Conectando a %s...\n", MQTT_SERVER);
+
+    String clientId = "ESP32_Torre_" + String(TORRE_ID);
+
+    if (mqtt.connect(clientId.c_str(), nullptr, nullptr,
+                     TOPIC_ONLINE, 0, true, "offline")) {
+      Serial.println("[MQTT] ✔ Conectado!");
+      mqtt.publish(TOPIC_ONLINE, "online", true);
+      mqtt.subscribe(TOPIC_CMD);
+      Serial.printf("[MQTT] Inscrito em: %s\n", TOPIC_CMD);
+    } else {
+      Serial.printf("[MQTT] ✘ Falhou (rc=%d). Tentando em 5s...\n", mqtt.state());
+      delay(5000);
+    }
+  }
+}
+
+// ============================================================
+//  OTA - REDE LOCAL (mantido)
+// ============================================================
+void setupOTA() {
+  String hostname = "Torre-" + String(TORRE_ID);
+  ArduinoOTA.setHostname(hostname.c_str());
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("\n[OTA] ▶ Iniciando atualização...");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\n[OTA] ✔ Concluído! Reiniciando...");
+  });
+  ArduinoOTA.onProgress([](unsigned int prog, unsigned int total) {
+    Serial.printf("[OTA] Progresso: %u%%\r", (prog * 100) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    Serial.printf("[OTA] ✘ Erro[%u]\n", err);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("[OTA] Pronto.");
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  printBanner();
+
+  // --- Sensor ---
+  pinMode(PINO_SENSOR, INPUT);
+  analogSetAttenuation(ADC_11db);
+  analogSetWidth(12);
+  Serial.println("[SENSOR] Pino 34 configurado.");
+
+  // --- WiFiManager ---
+  Serial.println("[WiFi] Iniciando WiFiManager...");
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+
+  String apName = "Torre_" + String(TORRE_ID) + "_Setup";
+  if (!wm.autoConnect(apName.c_str())) {
+    Serial.println("[WiFi] ✘ Timeout. Reiniciando...");
+    ESP.restart();
+  }
+
+  Serial.print("[WiFi] ✔ Conectado! IP: ");
+  Serial.println(WiFi.localIP());
+
+  // --- OTA local ---
+  setupOTA();
+
+  // --- MQTT ---
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+  conectarMQTT();
+
+  Serial.println();
+  Serial.println(F("════════════════════════════════════════"));
+  Serial.println(F("  Sistema pronto! Monitorando..."));
+  Serial.println(F("  Comandos MQTT em .../cmd: status | restart | update <URL>"));
+  Serial.println(F("════════════════════════════════════════"));
+  printStatus();
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  // OTA local sempre ativo
+  ArduinoOTA.handle();
+
+  // Reconexão MQTT se necessário
+  if (!mqtt.connected()) conectarMQTT();
+  mqtt.loop();
+
+  unsigned long agora = millis();
+
+  // --- Leitura do sensor a cada 2s ---
+  if (agora - tLeitura >= INTERVALO_LEITURA) {
+    tLeitura = agora;
+    processarLeitura();
+    printStatus();
+  }
+
+  // --- Publicação MQTT a cada 5s ---
+  if (agora - tPublish >= INTERVALO_PUBLISH) {
+    tPublish = agora;
+    publicarTelemetria();
+  }
+
+  // --- Checa WiFi a cada 30s ---
+  if (agora - tWifiChk >= INTERVALO_WIFI_CHK) {
+    tWifiChk = agora;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] ✘ Desconectado. Reconectando...");
+      WiFi.reconnect();
+    }
+  }
+}
