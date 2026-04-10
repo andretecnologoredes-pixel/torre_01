@@ -1,0 +1,402 @@
+// ============================================================
+//  MONITOR DE TORRE v3.2 - MQTT + BLYNK
+// ============================================================
+
+// >>>  MUDE APENAS ESTAS LINHAS PARA CADA TORRE  <<<
+#define TORRE_ID   "01"
+
+// >>>  DADOS DO BLYNK (copie do seu device no blynk.cloud)  <<<
+#define BLYNK_TEMPLATE_ID   "TMPL2SJ_k0LNK"
+#define BLYNK_TEMPLATE_NAME "MONITORAMENTO DE TORRES"
+#define BLYNK_AUTH_TOKEN    "E6m2D_mPsXXGUxr_EkREGEcyH5pVxOOM"
+
+// ============================================================
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>   // ← NOVO
+
+// ================= MQTT BROKER =================
+#define MQTT_SERVER   "broker.emqx.io"
+#define MQTT_PORT     1883
+
+// ================= TÓPICOS =================
+#define TOPIC_BASE    "torres/torre_" TORRE_ID
+#define TOPIC_TELEM   TOPIC_BASE "/telemetria"
+#define TOPIC_STATUS  TOPIC_BASE "/status"
+#define TOPIC_EVENTO  TOPIC_BASE "/evento"
+#define TOPIC_CMD     TOPIC_BASE "/cmd"
+#define TOPIC_ONLINE  TOPIC_BASE "/online"
+
+// ================= OTA INTERNET =================
+#define DEFAULT_FW_URL ""
+
+// ================= SENSOR =================
+#define PINO_SENSOR         34
+#define AMOSTRAS            400
+#define FILTRO_MEDIAS       4
+#define FATOR_CALIBRACAO    0.18f
+#define THRESHOLD_LAMPADA   6.0f
+#define MINIMO_RUIDO        3.0f
+
+// ================= ANTI FALSO POSITIVO =================
+#define TEMPO_CONFIRMACAO   10000UL
+#define TEMPO_RETORNO       3000UL
+
+// ================= INTERVALOS =================
+#define INTERVALO_LEITURA   2000UL
+#define INTERVALO_PUBLISH   5000UL
+#define INTERVALO_WIFI_CHK  30000UL
+
+// ================= ESTADO =================
+float         tensaoRms     = 0.0f;
+bool          lampadaOk     = true;
+bool          lastLampadaOk = true;
+unsigned long tempoFalha    = 0;
+unsigned long tempoRetorno  = 0;
+
+// ================= TIMERS =================
+unsigned long tLeitura   = 0;
+unsigned long tPublish   = 0;
+unsigned long tWifiChk   = 0;
+
+// ================= OBJETOS =================
+WiFiClient    espClient;
+PubSubClient  mqtt(espClient);
+BlynkTimer    blynkTimer;        // ← NOVO
+
+// ============================================================
+//  PRINT SERIAL (igual ao original)
+// ============================================================
+void printBanner() {
+  Serial.println();
+  Serial.println(F("╔══════════════════════════════════════╗"));
+  Serial.println(F("║     MONITOR DE TORRE - ESP32         ║"));
+  Serial.printf( "║     TORRE ID : %-22s║\n", TORRE_ID);
+  Serial.println(F("╚══════════════════════════════════════╝"));
+}
+
+void printStatus() {
+  Serial.println(F("┌──────────────────────────────────────┐"));
+  Serial.printf( "│ Torre   : %-27s│\n", TORRE_ID);
+  Serial.printf( "│ Tensão  : %-5.1f V                      │\n", tensaoRms);
+  Serial.printf( "│ Lâmpada : %-27s│\n", lampadaOk ? "✔  OPERACIONAL" : "✘  FALHA DETECTADA");
+  Serial.printf( "│ WiFi    : %-4d dBm                     │\n", WiFi.RSSI());
+  Serial.printf( "│ IP      : %-27s│\n", WiFi.localIP().toString().c_str());
+  Serial.printf( "│ MQTT    : %-27s│\n", mqtt.connected() ? "Conectado" : "Desconectado");
+  Serial.printf( "│ BLYNK   : %-27s│\n", Blynk.connected() ? "Conectado" : "Desconectado"); // ← NOVO
+  Serial.println(F("└──────────────────────────────────────┘"));
+}
+
+void printEvento(const char* msg) {
+  Serial.println(F("┌──────────────────────────────────────┐"));
+  Serial.printf( "│ ⚡ EVENTO: %-26s│\n", msg);
+  Serial.println(F("└──────────────────────────────────────┘"));
+}
+
+// ============================================================
+//  LEITURA RMS (igual ao original)
+// ============================================================
+float lerTensaoRMS() {
+  float somaTensoes = 0.0f;
+  for (int f = 0; f < FILTRO_MEDIAS; f++) {
+    uint32_t soma = 0;
+    float somaQ   = 0.0f;
+    for (int i = 0; i < AMOSTRAS; i++) {
+      soma += analogRead(PINO_SENSOR);
+      delayMicroseconds(80);
+    }
+    float offset = soma / (float)AMOSTRAS;
+    for (int i = 0; i < AMOSTRAS; i++) {
+      float s = analogRead(PINO_SENSOR) - offset;
+      somaQ  += s * s;
+      delayMicroseconds(80);
+    }
+    float rmsAdc = sqrtf(somaQ / (float)AMOSTRAS);
+    float tensao = rmsAdc * FATOR_CALIBRACAO;
+    if (tensao < MINIMO_RUIDO) tensao = 0.0f;
+    somaTensoes += tensao;
+  }
+  return somaTensoes / (float)FILTRO_MEDIAS;
+}
+
+// ============================================================
+//  BLYNK - ENVIAR DADOS (NOVO)
+// ============================================================
+void enviarParaBlynk() {
+  if (!Blynk.connected()) return;
+
+  // V0 = Status (0=OK, 1=FALHA)
+  Blynk.virtualWrite(V0, lampadaOk ? 0 : 1);
+
+  // V1 = Tensão
+  Blynk.virtualWrite(V1, tensaoRms);
+
+  // V2 = Hora formatada
+  unsigned long totalSeg = millis() / 1000;
+  int h = totalSeg / 3600;
+  int m = (totalSeg % 3600) / 60;
+  int s = totalSeg % 60;
+  String hora = String(h) + ":" + (m < 10 ? "0" : "") + String(m) + ":" + (s < 10 ? "0" : "") + String(s);
+  Blynk.virtualWrite(V2, hora);
+}
+
+// ============================================================
+//  MQTT - PUBLICAR EVENTO
+// ============================================================
+void publicarEvento(const char* msg) {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<128> doc;
+  doc["torre"]  = TORRE_ID;
+  doc["evento"] = msg;
+  doc["tensao"] = tensaoRms;
+  char payload[128];
+  serializeJson(doc, payload);
+  mqtt.publish(TOPIC_EVENTO, payload, false);
+  Serial.printf("[MQTT] Evento → %s\n", payload);
+}
+
+// ============================================================
+//  ANTI FALSO POSITIVO (igual ao original + disparo Blynk Event)
+// ============================================================
+void processarLeitura() {
+  tensaoRms = lerTensaoRMS();
+  bool leituraAtual = (tensaoRms > THRESHOLD_LAMPADA);
+
+  if (!leituraAtual) {
+    tempoRetorno = 0;
+    if (tempoFalha == 0) tempoFalha = millis();
+    if (lampadaOk && (millis() - tempoFalha >= TEMPO_CONFIRMACAO)) {
+      lampadaOk = false;
+      printEvento("Lampada APAGOU");
+      publicarEvento("Lampada apagou");
+
+      // ← NOVO: Dispara alerta no Blynk (aparece no celular)
+      if (Blynk.connected()) {
+        Blynk.logEvent("falha_torre",
+          String("🚨 TORRE ") + TORRE_ID + " EM FALHA! Tensão: " + tensaoRms + "V");
+      }
+    }
+  } else {
+    tempoFalha = 0;
+    if (!lampadaOk) {
+      if (tempoRetorno == 0) tempoRetorno = millis();
+      if (millis() - tempoRetorno >= TEMPO_RETORNO) {
+        lampadaOk    = true;
+        tempoRetorno = 0;
+        printEvento("Lampada VOLTOU");
+        publicarEvento("Lampada voltou");
+
+        // ← NOVO: Notifica retorno no Blynk
+        if (Blynk.connected()) {
+          Blynk.logEvent("falha_torre",
+            String("✅ TORRE ") + TORRE_ID + " VOLTOU! Tensão: " + tensaoRms + "V");
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+//  MQTT - PUBLICAR TELEMETRIA (igual ao original)
+// ============================================================
+void publicarTelemetria() {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<256> doc;
+  doc["torre"]   = TORRE_ID;
+  doc["tensao"]  = roundf(tensaoRms * 10.0f) / 10.0f;
+  doc["status"]  = lampadaOk ? "OK" : "FALHA";
+  doc["wifi"]    = WiFi.RSSI();
+  doc["ip"]      = WiFi.localIP().toString();
+  doc["uptime"]  = millis() / 1000;
+  char payload[256];
+  serializeJson(doc, payload);
+  mqtt.publish(TOPIC_TELEM,  payload, true);
+  mqtt.publish(TOPIC_STATUS, lampadaOk ? "OK" : "FALHA", true);
+  Serial.printf("[MQTT] Publicado → %s\n", payload);
+}
+
+// ============================================================
+//  OTA INTERNET (igual ao original)
+// ============================================================
+void publicarStatusOTA(const char* status, const char* detail) {
+  if (!mqtt.connected()) return;
+  StaticJsonDocument<256> doc;
+  doc["torre"] = TORRE_ID;
+  doc["status"] = status;
+  doc["detail"] = detail;
+  char out[256];
+  serializeJson(doc, out);
+  String t = String(TOPIC_BASE) + "/ota";
+  mqtt.publish(t.c_str(), out, false);
+}
+
+void atualizarFirmwarePorURL(const String& url) {
+  if (url.length() < 8) {
+    publicarStatusOTA("error", "url_invalida");
+    return;
+  }
+  Serial.printf("[OTA-HTTP] Iniciando: %s\n", url.c_str());
+  publicarStatusOTA("start", url.c_str());
+  WiFiClientSecure client;
+  client.setTimeout(15000);
+  client.setInsecure();
+  httpUpdate.rebootOnUpdate(true);
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  t_httpUpdate_return ret = httpUpdate.update(client, url);
+  switch (ret) {
+    case HTTP_UPDATE_FAILED: {
+      String err = String(httpUpdate.getLastError()) + ":" + httpUpdate.getLastErrorString();
+      publicarStatusOTA("failed", err.c_str());
+      break;
+    }
+    case HTTP_UPDATE_NO_UPDATES:
+      publicarStatusOTA("no_update", "sem_atualizacao");
+      break;
+    case HTTP_UPDATE_OK:
+      publicarStatusOTA("ok", "rebooting");
+      break;
+  }
+}
+
+// ============================================================
+//  MQTT CALLBACK (igual ao original)
+// ============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  String msg;
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+  msg.trim();
+  Serial.printf("[CMD] Recebido: %s\n", msg.c_str());
+  if (msg == "status") {
+    publicarTelemetria();
+  } else if (msg == "restart") {
+    delay(500);
+    ESP.restart();
+  } else if (msg.startsWith("update")) {
+    String url = "";
+    int sp = msg.indexOf(' ');
+    if (sp > 0) { url = msg.substring(sp + 1); url.trim(); }
+    else { url = String(DEFAULT_FW_URL); }
+    if (url.length() == 0) { publicarStatusOTA("error", "sem_url"); return; }
+    atualizarFirmwarePorURL(url);
+  }
+}
+
+// ============================================================
+//  MQTT RECONEXÃO (igual ao original)
+// ============================================================
+void conectarMQTT() {
+  while (!mqtt.connected()) {
+    Serial.printf("[MQTT] Conectando a %s...\n", MQTT_SERVER);
+    String clientId = "ESP32_Torre_" + String(TORRE_ID);
+    if (mqtt.connect(clientId.c_str(), nullptr, nullptr,
+                     TOPIC_ONLINE, 0, true, "offline")) {
+      Serial.println("[MQTT] ✔ Conectado!");
+      mqtt.publish(TOPIC_ONLINE, "online", true);
+      mqtt.subscribe(TOPIC_CMD);
+    } else {
+      Serial.printf("[MQTT] ✘ Falhou (rc=%d). Tentando em 5s...\n", mqtt.state());
+      delay(5000);
+    }
+  }
+}
+
+// ============================================================
+//  OTA LOCAL (igual ao original)
+// ============================================================
+void setupOTA() {
+  String hostname = "Torre-" + String(TORRE_ID);
+  ArduinoOTA.setHostname(hostname.c_str());
+  ArduinoOTA.onStart([]() { Serial.println("\n[OTA] Iniciando..."); });
+  ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] Concluído!"); });
+  ArduinoOTA.onProgress([](unsigned int prog, unsigned int total) {
+    Serial.printf("[OTA] %u%%\r", (prog * 100) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    Serial.printf("[OTA] Erro[%u]\n", err);
+  });
+  ArduinoOTA.begin();
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  printBanner();
+
+  pinMode(PINO_SENSOR, INPUT);
+  analogSetAttenuation(ADC_11db);
+  analogSetWidth(12);
+
+  // WiFiManager (igual ao original)
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  String apName = "Torre_" + String(TORRE_ID) + "_Setup";
+  if (!wm.autoConnect(apName.c_str())) {
+    ESP.restart();
+  }
+  Serial.print("[WiFi] ✔ IP: ");
+  Serial.println(WiFi.localIP());
+
+  // OTA local
+  setupOTA();
+
+  // MQTT
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+  conectarMQTT();
+
+  // ← NOVO: Conecta ao Blynk (não bloqueia o loop)
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect(3000);
+
+  // ← NOVO: Timer Blynk envia dados a cada 5s
+  blynkTimer.setInterval(5000L, enviarParaBlynk);
+
+  Serial.println(F("════════════════════════════════════════"));
+  Serial.println(F("  Sistema pronto! MQTT + BLYNK ativos"));
+  Serial.println(F("════════════════════════════════════════"));
+  printStatus();
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  ArduinoOTA.handle();
+
+  if (!mqtt.connected()) conectarMQTT();
+  mqtt.loop();
+
+  // ← NOVO: Blynk roda junto sem travar o loop
+  if (Blynk.connected()) Blynk.run();
+  blynkTimer.run();
+
+  unsigned long agora = millis();
+
+  if (agora - tLeitura >= INTERVALO_LEITURA) {
+    tLeitura = agora;
+    processarLeitura();
+    printStatus();
+  }
+
+  if (agora - tPublish >= INTERVALO_PUBLISH) {
+    tPublish = agora;
+    publicarTelemetria();
+  }
+
+  if (agora - tWifiChk >= INTERVALO_WIFI_CHK) {
+    tWifiChk = agora;
+    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+  }
+}
